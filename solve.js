@@ -43,6 +43,11 @@ export function run(input) {
   let recordLine = 1;
   let recordRow = null;
 
+  // quoted() reports its field through these instead of an object, so the
+  // hot loop allocates nothing per quoted field.
+  let qValue = '';
+  let qEnded = '';
+
   // Count line breaks (LF, or CR not followed by LF) in s[a..b) into line.
   // A CRLF pair counts once, through its LF.
   function countBreaks(a, b) {
@@ -138,7 +143,8 @@ export function run(input) {
     return { value, ended, added };
   }
 
-  // A quoted field whose opening quote is at pos.
+  // A quoted field whose opening quote is at pos. Reports through qValue /
+  // qEnded (see above).
   function quoted() {
     const open = pos;
     const openLine = line;
@@ -153,7 +159,10 @@ export function run(input) {
         pos = open + 1;
         line = openLine;
         errors.push({ code: 'unterminated_quote', line: recordLine, row: recordRow });
-        return unquoted('"');
+        const f = unquoted('"');
+        qValue = f.value;
+        qEnded = f.ended;
+        return;
       }
       if (s.charCodeAt(q + 1) === 34) {
         // Doubled quote: one literal quote.
@@ -175,48 +184,120 @@ export function run(input) {
       if (value.indexOf('\r') !== -1) value = value.split('\r\n').join('\n').split('\r').join('\n');
       countBreaks(open + 1, q);
       pos = q + 1;
-      if (pos >= n) return { value, ended: 'end' };
+      if (pos >= n) {
+        qValue = value;
+        qEnded = 'end';
+        return;
+      }
       const cc = s.charCodeAt(pos);
       if (cc === 44) {
         pos++;
-        return { value, ended: 'comma' };
+        qValue = value;
+        qEnded = 'comma';
+        return;
       }
       if (cc === 10) {
         pos++;
         line++;
-        return { value, ended: 'line break' };
+        qValue = value;
+        qEnded = 'line break';
+        return;
       }
       if (cc === 13 && s.charCodeAt(pos + 1) === 10) {
         pos += 2;
         line++;
-        return { value, ended: 'line break' };
+        qValue = value;
+        qEnded = 'line break';
+        return;
       }
       // What follows the closing quote is appended as it stands.
       const junk = unquoted(value);
       if (junk.added > 0) errors.push({ code: 'quote_junk', line: recordLine, row: recordRow });
-      return junk;
+      qValue = junk.value;
+      qEnded = junk.ended;
+      return;
     }
   }
 
   // Field-by-field record reader (slow path: a quote, or a stray CR, is in
-  // the record). Returns the fields and whether the first field was quoted.
+  // the record). The plain (unquoted) fields are parsed inline — no function
+  // call and no object per field. Returns the fields and whether the first
+  // field was quoted.
   function recordSlow() {
     const fields = [];
     let firstQuoted = false;
     let first = true;
-    let ended;
-    do {
-      let f;
+    while (true) {
+      let value;
+      let ended;
       if (s.charCodeAt(pos) === 34) {
         if (first) firstQuoted = true;
-        f = quoted();
+        quoted();
+        value = qValue;
+        ended = qEnded;
       } else {
-        f = unquoted('');
+        // Inline unquoted field: a tight charCodeAt scan to the next comma /
+        // LF / end. Ordinary chars (> 44) take one compare; only comma,
+        // quote, LF and CR (all <= 44) take the slow branch, and a quote
+        // inside an unquoted field is an ordinary literal character. A
+        // stray CR is dropped with an error and the field continues (pieces
+        // stays null unless that happens, so the common case is one slice).
+        let p = pos;
+        let segStart = pos;
+        let pieces = null;
+        let end = n;
+        ended = 'end';
+        while (p < n) {
+          const cc = s.charCodeAt(p);
+          if (cc > 44) {
+            p++;
+            continue;
+          }
+          if (cc === 44) {
+            end = p;
+            ended = 'comma';
+            break;
+          }
+          if (cc === 10) {
+            end = p;
+            ended = 'line break';
+            break;
+          }
+          if (cc === 13) {
+            if (s.charCodeAt(p + 1) === 10) {
+              end = p;
+              ended = 'line break';
+              break;
+            }
+            errors.push({ code: 'stray_cr', line: recordLine, row: recordRow });
+            if (pieces === null) pieces = [];
+            pieces.push(s.slice(segStart, p));
+            p++;
+            segStart = p;
+            continue;
+          }
+          p++;
+        }
+        if (pieces === null) {
+          value = s.slice(segStart, end);
+        } else {
+          pieces.push(s.slice(segStart, end));
+          value = pieces.join('');
+        }
+        if (ended === 'comma') {
+          pos = end + 1;
+        } else if (ended === 'line break') {
+          // end is the LF, or the CR of a CRLF pair.
+          pos = s.charCodeAt(end) === 13 ? end + 2 : end + 1;
+          line++;
+        } else {
+          pos = n;
+        }
       }
       first = false;
-      fields.push(f.value);
-      ended = f.ended;
-    } while (ended === 'comma');
+      fields.push(value);
+      if (ended !== 'comma') break;
+    }
     return { fields, firstQuoted };
   }
 
